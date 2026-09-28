@@ -1,0 +1,6 @@
+build/
+*.tar.gz
+__pycache__/
+*.spv
+*.o
+*.pyc

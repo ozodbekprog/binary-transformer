@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: MIT
+// binary_matmul.comp — bit-packed ternar matmul: [M x K] x [K x batch].
+//
+// Bit-plane usuli (CPU bilan bir xil semantika):
+//   total = popcount(Wpos & Xpos) + popcount(Wneg & Xneg)
+//         - popcount(Wpos & Xneg) - popcount(Wneg & Xpos)
+//
+// 64-bit o'rniga uint32 ishlatiladi (GLSL core'da 64-bit yo'q);
+// LUT/bitCount() native shader instruction.
+//
+// Ixtiyoriy: -DBT_USE_SUBGROUP — K ni subgroup bo'ylab taqsimlaydi
+// (subgroupAdd reduksiyasi va binary-parity uchun subgroupXor).
+#version 450
+#ifndef BT_WORKGROUP
+#define BT_WORKGROUP 256
+#endif
+
+#ifdef BT_USE_SUBGROUP
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+layout(local_size_x = BT_WORKGROUP) in;
+
+layout(binding = 0, std430) readonly buffer Wpos { uint wpos[]; };
+layout(binding = 1, std430) readonly buffer Wneg { uint wneg[]; };
+layout(binding = 2, std430) readonly buffer Xpos { uint xpos[]; };
+layout(binding = 3, std430) readonly buffer Xneg { uint xneg[]; };
+layout(binding = 4, std430) writeonly buffer Outv { int outv[]; };
+
+layout(push_constant) uniform PC {
+    uint m;        // qatorlar soni (output o'lchami)
+    uint k_words;  // K bo'ylab so'zlar (stride, uint32)
+    uint batch;    // X ustunlari (tokens)
+    uint mode;     // 0 = yig'indi, 1 = parity (subgroup yoqilganda)
+    uint w_base;   // shu layer og'irliklarining so'z-offseti
+} pc;
+
+void main() {
+    const uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.m) {
+        return;
+    }
+    const uint wrow = pc.w_base + row * pc.k_words;
+
+    for (uint b = 0u; b < pc.batch; ++b) {
+        const uint xrow = b * pc.k_words;
+        int total = 0;
+
+#ifdef BT_USE_SUBGROUP
+        int partial = 0;
+        for (uint i = gl_SubgroupInvocationID; i < pc.k_words;
+             i += gl_SubgroupSize) {
+            const uint wp = wpos[wrow + i];
+            const uint wn = wneg[wrow + i];
+            const uint xp = xpos[xrow + i];
+            const uint xn = xneg[xrow + i];
+            partial += int(bitCount(wp & xp)) + int(bitCount(wn & xn))
+                     - int(bitCount(wp & xn)) - int(bitCount(wn & xp));
+        }
+        total = subgroupAdd(partial);
+        // Binary XNOR pariteti — subgroupXor misoli (mode=1 da ishlatiladi).
+        // DIQQAT: subgroup operatsiyalari barcha lane'larda bajarilishi shart.
+        const int parity = subgroupXor(partial & 1) & 1;
+        if (gl_SubgroupInvocationID == 0u) {
+            outv[row * pc.batch + b] = (pc.mode == 1u) ? parity : total;
+        }
+#else
+        for (uint i = 0u; i < pc.k_words; ++i) {
+            const uint wp = wpos[wrow + i];
+            const uint wn = wneg[wrow + i];
+            const uint xp = xpos[xrow + i];
+            const uint xn = xneg[xrow + i];
+            total += int(bitCount(wp & xp)) + int(bitCount(wn & xn))
+                   - int(bitCount(wp & xn)) - int(bitCount(wn & xp));
+        }
+        outv[row * pc.batch + b] = total;
+#endif
+    }
+}
